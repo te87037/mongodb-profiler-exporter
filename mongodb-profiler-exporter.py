@@ -16,7 +16,7 @@ default_labels = ["db", "ns", "query_hash"]
 # Prometheus metrics
 slow_queries_count_total = Counter('slow_queries_count_total', 'Total number of slow queries', default_labels)
 slow_queries_info = Gauge("slow_queries_info", "Information about slow query",
-                         default_labels + ["query_shape", "query_framework", "op", "plan_summary"])
+                          default_labels + ["query_shape", "query_framework", "op", "plan_summary"])
 slow_queries_duration_total = Counter('slow_queries_duration_total', 'Total execution time of slow queries in milliseconds', default_labels)
 slow_queries_keys_examined_total = Counter('slow_queries_keys_examined_total', 'Total number of examined keys', default_labels)
 slow_queries_docs_examined_total = Counter('slow_queries_docs_examined_total', 'Total number of examined documents', default_labels)
@@ -29,21 +29,25 @@ fields_to_metrics_map = {
     "nreturned": slow_queries_nreturned_total
 }
 
+
 def connect_to_mongo(uri):
     client = pymongo.MongoClient(uri)
     return client
 
+
 def get_query_hash_values(db, ns, start_time, end_time):
     profile_collection = db.system.profile
     # Find unique queryHash values
-    unique_query_hashes = profile_collection.distinct("queryHash", {"ns": ns ,"ts": {"$gte": start_time, "$lt": end_time}})
+    unique_query_hashes = profile_collection.distinct("queryHash", {"ns": ns, "ts": {"$gte": start_time, "$lt": end_time}})
     return unique_query_hashes
+
 
 def get_ns_values(db, start_time, end_time):
     profile_collection = db.system.profile
     # Find unique ns values
     unique_ns_values = profile_collection.distinct("ns", {"ts": {"$gte": start_time, "$lt": end_time}})
     return unique_ns_values
+
 
 def get_slow_queries_count(db, ns, query_hash, start_time, end_time):
     profile_collection = db.system.profile
@@ -52,15 +56,36 @@ def get_slow_queries_count(db, ns, query_hash, start_time, end_time):
     count = profile_collection.count_documents(query)
     return count
 
+
 def get_slow_queries_value_sum(db, ns, query_hash, start_time, end_time, fields):
+    """
+    修改重點：
+    1. 先將聚合結果變成 list，然後確認是否為空。
+    2. 若為空，回傳 0，避免使用 [0] 拋 IndexError。
+    """
     profile_collection = db.system.profile
     # Find values within the specified time window
-    match_stage = {"$match": {"queryHash": query_hash, "ns": ns, "ts": {"$gte": start_time, "$lt": end_time}}}
+    match_stage = {
+        "$match": {
+            "queryHash": query_hash,
+            "ns": ns,
+            "ts": {"$gte": start_time, "$lt": end_time}
+        }
+    }
     fields_formatted = {f"{field}": {"$sum": f"${field}"} for field in fields}
     group_stage = {"$group": {"_id": None, **fields_formatted}}
     query = [match_stage, group_stage]
-    result = list(profile_collection.aggregate(query))[0]
+    
+    pipeline_result = list(profile_collection.aggregate(query))
+
+    if not pipeline_result:
+        # 若空結果，代表此時間範圍內沒有符合的文件
+        logging.debug(f"[get_slow_queries_value_sum] Empty aggregation result for ns={ns}, queryHash={query_hash}")
+        return {field: 0 for field in fields}
+
+    result = pipeline_result[0]
     return {field: result.get(field, 0) for field in fields}
+
 
 def remove_keys_and_replace(query, keys_to_remove, replace_value="?"):
     # Recursively remove keys and replace values in the query.
@@ -76,21 +101,29 @@ def remove_keys_and_replace(query, keys_to_remove, replace_value="?"):
         return replace_value
     return query
 
+
 def get_query_info_values(db, ns, query_hash, start_time, end_time, keys_to_remove):
     # Get query information values for Prometheus metric.
     profile_collection = db.system.profile
 
-    query = {"queryHash": query_hash,"ns": ns, "ts": {"$gte": start_time, "$lt": end_time}, "command.getMore": {"$exists": False}, "command.explain": {"$exists": False}}
+    query = {
+        "queryHash": query_hash,
+        "ns": ns,
+        "ts": {"$gte": start_time, "$lt": end_time},
+        "command.getMore": {"$exists": False},
+        "command.explain": {"$exists": False}
+    }
     result = list(profile_collection.find(query).limit(1))
     if result:
-        query = result[0].get("command", "")
+        command_obj = result[0].get("command", {})
         query_framework = result[0].get("queryFramework", "")
         op = result[0].get("op", "")
         plan_summary = result[0].get("planSummary", "")
-        query_shape = remove_keys_and_replace(query, keys_to_remove)
+        query_shape = remove_keys_and_replace(command_obj, keys_to_remove)
     else:
         query_shape, query_framework, op, plan_summary = '', '', '', ''
     return [query_shape, query_framework, op, plan_summary]
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='MongoDB Prometheus Exporter',
@@ -107,9 +140,10 @@ def parse_args():
     parser.add_argument('--listen-port', type=int, default=os.getenv('LISTEN_PORT', 9179),
                         help='Port to listen')
     parser.add_argument('--verbose', action='store_true', default=os.getenv('VERBOSE', False),
-                    help='Enable Verbose Mode')
+                        help='Enable Verbose Mode')
 
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -128,7 +162,7 @@ def main():
     start_http_server(args.listen_port, addr=args.listen_ip)
 
     slow_queries_info_last_cleared = datetime.now(ZoneInfo("UTC"))
-    slow_queries_info_last_clear_interval=300 # seconds
+    slow_queries_info_last_clear_interval = 300  # seconds
 
     while True:
         loop_start = time.time()
@@ -145,48 +179,67 @@ def main():
 
             # Get the list of databases
             databases = mongo_client.list_database_names()
-
             # Remove some dbs
             excluded_dbs = ["local", "admin", "config", "test"]
             valid_dbs = [db for db in databases if db not in excluded_dbs]
-            if verbose: print(f"Discovered Databases: {valid_dbs}")
-            if verbose: print(f"Start Queries Discovery in system.profile")
+            if verbose:
+                print(f"Discovered Databases: {valid_dbs}")
+                print(f"Start Queries Discovery in system.profile")
 
             # Iterate through valid databases and update metrics
             for db_name in valid_dbs:
                 db = mongo_client[db_name]
                 ns_values = get_ns_values(db, start_time, end_time)
                 if ns_values:
-                    if verbose: print(f"Discovered NS in {db_name} Database: {ns_values}")
+                    if verbose:
+                        print(f"Discovered NS in {db_name} Database: {ns_values}")
                     for ns in ns_values:
                         query_hash_values = get_query_hash_values(db, ns, start_time, end_time)
                         if query_hash_values:
-                            if verbose: print(f"Discovered queryHash in {ns}: {query_hash_values}")
+                            if verbose:
+                                print(f"Discovered queryHash in {ns}: {query_hash_values}")
                             for query_hash in query_hash_values:
                                 count = get_slow_queries_count(db, ns, query_hash, start_time, end_time)
+                                if verbose:
+                                    print(f"Count for ns={ns}, queryHash={query_hash} = {count}")
                                 slow_queries_count_total.labels(db=db_name, ns=ns, query_hash=query_hash).inc(count)
+                                
+                                # 多印一行 Log 確認 inc() 是否執行
+                                logging.debug(f"Inc slow_queries_count_total by {count} for {db_name}, ns={ns}, queryHash={query_hash}")
 
                                 slow_queries_values = get_slow_queries_value_sum(db, ns, query_hash, start_time, end_time, fields_to_metrics_map.keys())
 
+                                # 將每個欄位對應的值加到 prometheus counter
                                 for field, metric in fields_to_metrics_map.items():
-                                    metric.labels(db=db_name, ns=ns, query_hash=query_hash).inc(slow_queries_values.get(field, 0))
+                                    increment_value = slow_queries_values.get(field, 0)
+                                    metric.labels(db=db_name, ns=ns, query_hash=query_hash).inc(increment_value)
+                                    if verbose:
+                                        print(f"Inc {field} by {increment_value} for ns={ns}, queryHash={query_hash}")
 
+                                # 取得慢查詢資訊並更新 slow_queries_info
                                 query_info = get_query_info_values(db, ns, query_hash, start_time, end_time, keys_to_remove)
 
-                                # Clear slow_queries_info metric to handle queries change, such as plan_summary update
+                                # 定期清理 slow_queries_info (Gauge)，避免 label 出現過多
                                 if datetime.now(ZoneInfo("UTC")) - slow_queries_info_last_cleared >= timedelta(seconds=slow_queries_info_last_clear_interval):
                                     slow_queries_info._metrics.clear()
                                     slow_queries_info_last_cleared = datetime.now(ZoneInfo("UTC"))
+
+                                # 若確有查詢資訊，就 set(1) 到 slow_queries_info
                                 if query_info[0] != '':
                                     slow_queries_info.labels(db=db_name, ns=ns, query_hash=query_hash,
-                                    query_shape=str(query_info[0])[:args.max_string_size],
-                                    query_framework=query_info[1], op=query_info[2],
-                                    plan_summary=str(query_info[3])[:args.max_string_size]).set(1)
+                                                             query_shape=str(query_info[0])[:args.max_string_size],
+                                                             query_framework=query_info[1],
+                                                             op=query_info[2],
+                                                             plan_summary=str(query_info[3])[:args.max_string_size]
+                                                             ).set(1)
+                                    if verbose:
+                                        print(f"Set slow_queries_info for {db_name}, ns={ns}, queryHash={query_hash}")
                         else:
-                             if verbose: print(f"Discovered no query_hash_values in {ns}")
+                            if verbose:
+                                print(f"Discovered no query_hash_values in {ns}")
                 else:
-                    if verbose: print(f"No namespaces (NS) found in the 'system.profile' collection of the '{db_name}' database.")
-
+                    if verbose:
+                        print(f"No namespaces (NS) found in the 'system.profile' collection of the '{db_name}' database.")
 
             # Close MongoDB connection
             mongo_client.close()
@@ -196,8 +249,11 @@ def main():
 
         # Calculate the time taken to execute the command
         elapsed = time.time() - loop_start
-        if verbose: print(f'Elapsed loop execution time: {elapsed:.2f} seconds\n')
-        time.sleep(max(0, args.wait_interval - elapsed - 0.0005)) # try to keep loop at interval by extracting actual execution time
+        if verbose:
+            print(f'Elapsed loop execution time: {elapsed:.2f} seconds\n')
+        # try to keep loop at interval by extracting actual execution time
+        time.sleep(max(0, args.wait_interval - elapsed - 0.0005))
+
 
 if __name__ == '__main__':
     main()
